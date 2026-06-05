@@ -1,18 +1,118 @@
 // ============================================================
 // FlashLearn Hub — data.js
-// All deck definitions + 415+ flashcard Q&A content
+// Deck definitions + 415+ flashcard Q&A
 // Subjects: HCI/UI/UX, OOP, IM, Python, E-Commerce,
 //           Network Admin, Quantitative Methods
 // ============================================================
 
 // ════════════════════════════════════════════
-// AUTH — Login / Signup / Logout
 // ════════════════════════════════════════════
-const USERS_KEY = 'fl_users';
+// AUTH — Login / Signup / Session
+// ════════════════════════════════════════════
+const USERS_KEY   = 'fl_users';
 const SESSION_KEY = 'fl_session';
 
-// Auth removed — app loads directly
-function doLogout(){ location.reload(); }
+function getUsers(){ try{ return JSON.parse(localStorage.getItem(USERS_KEY)||'[]'); }catch{ return []; } }
+function saveUsers(u){ localStorage.setItem(USERS_KEY, JSON.stringify(u)); }
+function getSession(){ try{ return JSON.parse(sessionStorage.getItem(SESSION_KEY)||'null'); }catch{ return null; } }
+function saveSession(u){ sessionStorage.setItem(SESSION_KEY, JSON.stringify(u)); }
+function clearSession(){ sessionStorage.removeItem(SESSION_KEY); }
+
+function switchAuthTab(tab){
+  const isLogin = tab === 'login';
+  document.getElementById('panelLogin').style.display  = isLogin ? '' : 'none';
+  document.getElementById('panelSignup').style.display = isLogin ? 'none' : '';
+  document.getElementById('tabLogin').classList.toggle('active', isLogin);
+  document.getElementById('tabSignup').classList.toggle('active', !isLogin);
+  document.getElementById('loginError').textContent  = '';
+  document.getElementById('signupError').textContent = '';
+}
+
+function doLogin(){
+  const email = document.getElementById('loginEmail').value.trim().toLowerCase();
+  const pass  = document.getElementById('loginPass').value;
+  const errEl = document.getElementById('loginError');
+  errEl.textContent = '';
+  if(!email || !pass){ errEl.textContent = 'Please enter your email and password.'; return; }
+  const users = getUsers();
+  const user  = users.find(u => u.email === email);
+  if(!user){ errEl.textContent = 'No account found with that email.'; return; }
+  if(user.password !== btoa(pass)){ errEl.textContent = 'Incorrect password.'; return; }
+  saveSession(user);
+  enterApp(user);
+}
+
+function doSignup(){
+  const name  = document.getElementById('signupName').value.trim();
+  const email = document.getElementById('signupEmail').value.trim().toLowerCase();
+  const pass  = document.getElementById('signupPass').value;
+  const pass2 = document.getElementById('signupPass2').value;
+  const errEl = document.getElementById('signupError');
+  errEl.textContent = '';
+  if(!name)                         { errEl.textContent = 'Please enter your name.'; return; }
+  if(!email || !email.includes('@')) { errEl.textContent = 'Please enter a valid email.'; return; }
+  if(pass.length < 6)               { errEl.textContent = 'Password must be at least 6 characters.'; return; }
+  if(pass !== pass2)                { errEl.textContent = 'Passwords do not match.'; return; }
+  const users = getUsers();
+  if(users.find(u => u.email === email)){ errEl.textContent = 'An account with that email already exists.'; return; }
+  const user = { name, email, password: btoa(pass), created: Date.now() };
+  users.push(user);
+  saveUsers(users);
+  saveSession(user);
+  enterApp(user);
+}
+
+function enterApp(user){
+  const initials = user.name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+  const av = document.getElementById('userAvatar');
+  if(av){ av.textContent = initials; av.style.background = 'linear-gradient(135deg,var(--accent),var(--teal))'; }
+  const un = document.getElementById('userName');
+  if(un) un.textContent = user.name.split(' ')[0];
+  const ue = document.getElementById('userEmailDisplay');
+  if(ue) ue.textContent = user.email;
+  const gn = document.getElementById('greetingName');
+  if(gn) gn.textContent = user.name.split(' ')[0];
+  // Clear navigation history — fresh start after login
+  _pageHistory = [];
+  _currentPage = 'dashboard';
+  // Hide back button
+  const backBtn = document.getElementById('backBtn');
+  if(backBtn) backBtn.classList.remove('visible');
+  // Hide auth screen
+  document.getElementById('authScreen').classList.add('hidden');
+  // Go to home
+  showPage('dashboard', null, false);
+  toast('Welcome, ' + user.name.split(' ')[0] + '!');
+}
+
+function doLogout(){
+  clearSession();
+  _pageHistory = [];
+  _currentPage = 'dashboard';
+  const backBtn = document.getElementById('backBtn');
+  if(backBtn) backBtn.classList.remove('visible');
+  ['loginEmail','loginPass','signupName','signupEmail','signupPass','signupPass2'].forEach(id=>{
+    const el = document.getElementById(id); if(el) el.value='';
+  });
+  ['loginError','signupError'].forEach(id=>{
+    const el = document.getElementById(id); if(el) el.textContent='';
+  });
+  switchAuthTab('login');
+  document.getElementById('authScreen').classList.remove('hidden');
+  // Push auth state so back button goes nowhere behind it
+  history.pushState({page:'auth'}, '', '#login');
+}
+
+// Auto-login if session exists
+(function checkSession(){
+  const user = getSession();
+  if(user){
+    enterApp(user);
+  } else {
+    // No session — show auth, set history state so back button can't bypass it
+    history.replaceState({page:'auth'}, '', '#login');
+  }
+})();
 // ════════════════════════════════════════════
 // BASE CARD DATA (8 per subject = rotated into 30-card sets)
 // ════════════════════════════════════════════

@@ -1,7 +1,7 @@
 // ============================================================
 // FlashLearn Hub — app.js
-// All app logic: flashcards, quiz, timer, notes,
-// progress tracking, themes, navigation
+// All logic: auth, flashcards (flip+type), quiz, timer,
+// notes, search, progress, custom subjects, navigation
 // ============================================================
 
 function buildFullStack(deckId){
@@ -145,8 +145,10 @@ function logSession(){
  }
 }
 let prefs={heatmap:true,chart:true};
-let currentTheme=null; // null = using default CSS accent, set when user picks a colour
+let currentTheme=null;
 let currentMode='light'; document.body.classList.add('theme-light');
+let _pageHistory = [];
+let _currentPage = 'dashboard';
 let activeNoteId=null;
 let notes=[
  {id:1,title:'OOP — Key Pillars Summary',body:'The 4 pillars of OOP:\n1. Encapsulation — bundle data + methods, hide internals\n2. Abstraction — expose only what is needed\n3. Inheritance — reuse parent class properties in child class\n4. Polymorphism — one interface, many implementations\n\nRemember: abstract classes can have method bodies; interfaces (in Java) cannot (before Java 8 default methods).'},
@@ -179,12 +181,25 @@ const DHEX={oop:'#7c6af5',im:'#3ecfb2',py:'#f5c542',hci:'#ff7e6b',ec:'#55d48b',n
 
 // Compute real mastery % from deckStats (flashcard + quiz combined accuracy)
 function getMastery(deckId){
- const s = deckStats[deckId];
- if(!s) return 0;
- const totalSeen = (s.seen || 0) + (s.quizTotal || 0);
- const totalCorrect = (s.correct || 0) + (s.quizCorrect || 0);
- if(totalSeen === 0) return 0;
- return Math.min(100, Math.round(totalCorrect / totalSeen * 100));
+  const s = deckStats[deckId];
+  if(!s) return 0;
+  const totalCards = (BASE_CARDS[deckId]||[]).length + (extraCards[deckId]||[]).length;
+  const seen       = Math.min(s.seen || 0, totalCards);
+  const correct    = s.correct || 0;
+  const quizTotal  = s.quizTotal || 0;
+  const quizCorrect= s.quizCorrect || 0;
+
+  // Accuracy: what % they got right out of what they answered
+  const totalAnswered = seen + quizTotal;
+  const totalCorrect  = correct + quizCorrect;
+  const accuracy = totalAnswered > 0 ? totalCorrect / totalAnswered : 0;
+
+  // Coverage: what % of the deck they've seen
+  const coverage = totalCards > 0 ? Math.min(seen / totalCards, 1) : 0;
+
+  // Mastery = 70% accuracy + 30% coverage (encourages seeing all cards)
+  const mastery = Math.round((accuracy * 0.7 + coverage * 0.3) * 100);
+  return Math.min(100, mastery);
 }
 
 function renderDashboard(){
@@ -231,6 +246,7 @@ function goFlashcards(id){
 // FLASHCARDS (30-item shuffled sets)
 // ════════════════════════════════════════════
 function initFC(){
+  _typeStats = {correct:0, partial:0, wrong:0, skipped:0};
  // Build deck selector chips
  document.getElementById('deckSelector').innerHTML=DECKS.map(d=>`<button class="deck-chip${d.id===curDeck?' active':''}" onclick="switchDeck('${d.id}',this)">${d.name}</button>`).join('');
  loadDeck(curDeck);
@@ -259,12 +275,16 @@ function showFCCard(){
  document.getElementById('fcA').textContent=c.a;
  document.getElementById('fcTag').textContent=c.t;
  document.getElementById('fcTag2').textContent=c.t;
- document.getElementById('fcCounter').textContent=`Card ${fcIdx+1} of ${SET_SIZE}`;
- document.getElementById('fcBar').style.width=(fcIdx/SET_SIZE*100)+'%';
+ const _fcPct = Math.round((fcIdx / SET_SIZE) * 100);
+ document.getElementById('fcCounter').textContent=`Card ${fcIdx+1} of ${SET_SIZE} · ${_fcPct}% done`;
+ document.getElementById('fcBar').style.width=_fcPct+'%';
+ document.getElementById('fcBar').setAttribute('title', `${fcIdx} of ${SET_SIZE} cards answered`);
  document.getElementById('fcInner').classList.remove('flipped');
  fcFlipped=false;
- document.getElementById('fcHint').textContent='👆 Click or tap the card to reveal the answer';
+ document.getElementById('fcHint').textContent='Click or tap the card to reveal the answer';
  document.querySelectorAll('.fc-btns button').forEach(b=>b.classList.remove('unlocked'));
+ // Sync type mode if active
+ if(_fcMode==='type') syncTypeCard();
 }
 function flipCard(){
  fcFlipped=!fcFlipped;
@@ -290,6 +310,13 @@ function rateCard(r){
  }
  updateLiveStats();
  fcIdx++;
+ // Update progress bar immediately after rating
+ const _ratedPct = Math.round((fcIdx / SET_SIZE) * 100);
+ document.getElementById('fcBar').style.width = _ratedPct + '%';
+ if(document.getElementById('fcCounter'))
+   document.getElementById('fcCounter').textContent = fcIdx < SET_SIZE
+     ? `Card ${fcIdx+1} of ${SET_SIZE} · ${_ratedPct}% done`
+     : `All ${SET_SIZE} cards done! · 100% done`;
  setTimeout(showFCCard,180);
 }
 function showFCDone(){
@@ -321,112 +348,429 @@ function restartDeck(){
 // ════════════════════════════════════════════
 // DECKS PAGE
 // ════════════════════════════════════════════
+// ── Track editing state ──
+let _editingCardDeckId = null;
+let _editingCardIndex  = null;
+let _editingSubjectId  = null;
+
 function renderDecks(){
- document.getElementById('deckGrid').innerHTML=DECKS.map(d=>{
- const total=(BASE_CARDS[d.id]||[]).length+(extraCards[d.id]||[]).length;
- return `<div class="dk-card" onclick="goFlashcards('${d.id}')">
- <div style="position:absolute;top:0;left:0;right:0;height:3px;background:${DHEX[d.id]};border-radius:14px 14px 0 0"></div>
- <div class="dk-icon" style="background:${DHEX[d.id]||d.color};border-radius:50%;width:36px;height:36px;flex-shrink:0"></div>
- <div class="dk-name">${d.name}</div>
- <div class="dk-count">${total} cards · ${d.due} due</div>
- <div class="dk-pb-bg"><div class="dk-pb" style="width:0%;background:${DHEX[d.id]}" data-w="${getMastery(d.id)}"></div></div>
- <div class="dk-mastery"><span>Mastery</span><span>${getMastery(d.id) > 0 ? getMastery(d.id)+'%' : '—'}</span></div>
- </div>`;
- }).join('');
- setTimeout(()=>document.querySelectorAll('.dk-pb').forEach(b=>b.style.width=b.dataset.w+'%'),100);
+  const grid = document.getElementById('deckGrid');
+  if(!grid) return;
+  if(DECKS.length === 0){
+    grid.innerHTML = '<div class="empty-state"><div class="empty-icon">📚</div>No subjects yet.<br>Click <strong>+ New Subject</strong> to create one.</div>';
+    return;
+  }
+  grid.innerHTML = DECKS.map(d => {
+    const total = (BASE_CARDS[d.id]||[]).length + (extraCards[d.id]||[]).length;
+    const customCount = (extraCards[d.id]||[]).length;
+    const mastery = getMastery(d.id);
+    const isCustom = !['oop','im','py','hci','ec','net','qm'].includes(d.id);
+    return `<div class="dk-card" style="cursor:pointer">
+      <div style="position:absolute;top:0;left:0;right:0;height:4px;background:${DHEX[d.id]||d.color};border-radius:14px 14px 0 0"></div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:0.5rem">
+        <div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0" onclick="goFlashcards('${d.id}')">
+          <div style="width:14px;height:14px;border-radius:50%;background:${DHEX[d.id]||d.color};flex-shrink:0;box-shadow:0 0 0 3px rgba(0,0,0,0.08)"></div>
+          <div style="min-width:0">
+            <div class="dk-name" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${d.name}</div>
+            <div class="dk-count">${total} cards${customCount > 0 ? ' · '+customCount+' custom' : ''}</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:4px;flex-shrink:0">
+          <button class="btn btn-sm" style="padding:4px 8px;font-size:0.7rem;background:rgba(var(--accentRGB),0.1);color:var(--accent);border:1px solid rgba(var(--accentRGB),0.2)" onclick="openManageCards('${d.id}')">Manage</button>
+          ${isCustom ? `<button class="btn btn-sm" style="padding:4px 8px;font-size:0.7rem;background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.25)" onclick="deleteSubject('${d.id}')">Delete</button>` : ''}
+        </div>
+      </div>
+      <div onclick="goFlashcards('${d.id}')">
+        <div class="dk-pb-bg"><div class="dk-pb" style="width:0%;background:${DHEX[d.id]||d.color}" data-w="${mastery}"></div></div>
+        <div class="dk-mastery"><span>Mastery</span><span style="color:${DHEX[d.id]||d.color};font-weight:600">${mastery > 0 ? mastery+'%' : 'Not started'}</span></div>
+      </div>
+    </div>`;
+  }).join('');
+  setTimeout(()=>document.querySelectorAll('.dk-pb').forEach(b=>b.style.width=b.dataset.w+'%'),100);
 }
 
-function populateNewDeckSelect(){
- const sel = document.getElementById('newDeck');
- if(!sel) return;
- sel.innerHTML = DECKS.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+function populateNewDeckSelect(selectedId){
+  const sel = document.getElementById('newDeck');
+  if(!sel) return;
+  sel.innerHTML = DECKS.map(d => `<option value="${d.id}"${d.id===selectedId?' selected':''}>${d.name}</option>`).join('');
 }
+
+const COLOR_OPTIONS = [
+  {name:'Ocean Blue',    hex:'#0eb8d8'},
+  {name:'Sky Blue',      hex:'#0284c7'},
+  {name:'Royal Blue',    hex:'#3b82f6'},
+  {name:'Indigo',        hex:'#6366f1'},
+  {name:'Violet',        hex:'#8b5cf6'},
+  {name:'Purple',        hex:'#a855f7'},
+  {name:'Pink',          hex:'#ec4899'},
+  {name:'Rose',          hex:'#fb7185'},
+  {name:'Red',           hex:'#ef4444'},
+  {name:'Orange',        hex:'#f97316'},
+  {name:'Amber',         hex:'#f59e0b'},
+  {name:'Yellow',        hex:'#eab308'},
+  {name:'Lime Green',    hex:'#84cc16'},
+  {name:'Green',         hex:'#40c264'},
+  {name:'Emerald',       hex:'#10b981'},
+  {name:'Teal',          hex:'#14b8a6'},
+  {name:'Cyan',          hex:'#06b6d4'},
+  {name:'Fuchsia',       hex:'#d946ef'},
+  {name:'Slate',         hex:'#64748b'},
+  {name:'Brown',         hex:'#78716c'},
+];
 
 function populateColorPicker(){
- const cp = document.getElementById('colorPicker');
- if(!cp || cp.children.length > 0) return; // already populated
- cp.innerHTML = THEMES.map((t,i) => `
- <div class="color-swatch${i===0?' active':''}" data-color="${t.accent}"
- style="background:${t.accent}" title="${t.label}"
- onclick="pickColor(this)"></div>`).join('');
- selectedSwatchColor = THEMES[0].accent;
+  const cp = document.getElementById('colorPicker');
+  if(!cp) return;
+  if(!selectedSwatchColor) selectedSwatchColor = COLOR_OPTIONS[0].hex;
+  cp.innerHTML = `
+    <select id="colorDropdown" onchange="pickColorDropdown(this)"
+      style="width:100%;background:var(--card2);border:1px solid var(--border2);
+             border-radius:8px;color:var(--text);font-family:'Plus Jakarta Sans',sans-serif;
+             font-size:0.88rem;padding:0.65rem 0.9rem;outline:none;cursor:pointer;
+             transition:border-color 0.2s;appearance:none;-webkit-appearance:none;
+             background-image:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%234a7090' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E\");
+             background-repeat:no-repeat;background-position:right 12px center;padding-right:2rem">
+      ${COLOR_OPTIONS.map(c =>
+        `<option value="${c.hex}" ${c.hex===selectedSwatchColor?'selected':''}>${c.name}</option>`
+      ).join('')}
+    </select>
+    <div id="colorPreview" style="margin-top:8px;display:flex;align-items:center;gap:8px">
+      <div id="colorDot" style="width:20px;height:20px;border-radius:50%;background:${selectedSwatchColor};flex-shrink:0;box-shadow:0 1px 4px rgba(0,0,0,0.2)"></div>
+      <span style="font-size:0.78rem;color:var(--muted)" id="colorLabel">${COLOR_OPTIONS.find(c=>c.hex===selectedSwatchColor)?.name||''}</span>
+    </div>`;
 }
 
-function openForm(type){
- // Close both first
- document.getElementById('addCardForm').classList.remove('open');
- document.getElementById('addSubjectForm').classList.remove('open');
- if(type === 'card'){
- populateNewDeckSelect();
- document.getElementById('addCardForm').classList.add('open');
- setTimeout(()=>document.getElementById('newQ').focus(), 50);
- } else {
- populateColorPicker();
- document.getElementById('addSubjectForm').classList.add('open');
- setTimeout(()=>document.getElementById('newSubjName').focus(), 50);
- }
+function pickColorDropdown(sel){
+  selectedSwatchColor = sel.value;
+  const dot   = document.getElementById('colorDot');
+  const label = document.getElementById('colorLabel');
+  if(dot)   dot.style.background = selectedSwatchColor;
+  if(label) label.textContent = COLOR_OPTIONS.find(c=>c.hex===selectedSwatchColor)?.name||'';
+}
+
+function pickColor(el){
+  document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+  el.classList.add('active');
+  selectedSwatchColor = el.dataset.color;
+}
+
+function openForm(type, deckId){
+  document.getElementById('addCardForm').classList.remove('open');
+  document.getElementById('addSubjectForm').classList.remove('open');
+  document.getElementById('manageCardsPanel').style.display = 'none';
+  _editingCardIndex = null;
+  _editingSubjectId = null;
+
+  if(type === 'card'){
+    _editingCardDeckId = deckId || null;
+    populateNewDeckSelect(deckId);
+    document.getElementById('cardFormTitle').textContent = 'Add Question';
+    document.getElementById('newQ').value = '';
+    document.getElementById('newA').value = '';
+    document.getElementById('addCardForm').classList.add('open');
+    document.getElementById('addCardForm').scrollIntoView({behavior:'smooth',block:'start'});
+    setTimeout(()=>document.getElementById('newQ').focus(), 100);
+  } else {
+    populateColorPicker();
+    document.getElementById('subjectFormTitle').textContent = 'Create Subject';
+    document.getElementById('newSubjName').value = '';
+  
+    document.getElementById('addSubjectForm').classList.add('open');
+    document.getElementById('addSubjectForm').scrollIntoView({behavior:'smooth',block:'start'});
+    setTimeout(()=>document.getElementById('newSubjName').focus(), 100);
+  }
+}
+
+function openAddCardForDeck(){
+  const deckId = document.getElementById('manageCardsTitle').dataset.deckid;
+  openForm('card', deckId);
 }
 
 function closeForm(type){
- if(type === 'card') document.getElementById('addCardForm').classList.remove('open');
- if(type === 'subject') document.getElementById('addSubjectForm').classList.remove('open');
+  if(type === 'card'){
+    document.getElementById('addCardForm').classList.remove('open');
+    _editingCardIndex = null;
+  }
+  if(type === 'subject'){
+    document.getElementById('addSubjectForm').classList.remove('open');
+    _editingSubjectId = null;
+  }
 }
 
-// Keep toggleAddForm as alias so any other references don't break
 function toggleAddForm(){ openForm('card'); }
 
 function pickColor(el){
- document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
- el.classList.add('active');
- selectedSwatchColor = el.dataset.color;
+  document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+  el.classList.add('active');
+  selectedSwatchColor = el.dataset.color;
 }
 
-function addCard(){
- const deckId = document.getElementById('newDeck').value;
- const q = document.getElementById('newQ').value.trim();
- const a = document.getElementById('newA').value.trim();
- if(!q || !a){ toast(' Fill in both question and answer.'); return; }
- const deck = DECKS.find(d => d.id === deckId);
- const tag = deck ? deck.name.split(' ').slice(0,2).join(' ') : deckId;
- if(!extraCards[deckId]) extraCards[deckId] = [];
- extraCards[deckId].push({q, a, t: tag});
- // Reset stack so new card is included in next set
- if(deckStacks[deckId]) deckStacks[deckId] = [];
- document.getElementById('newQ').value = '';
- document.getElementById('newA').value = '';
- closeForm('card');
- renderDecks();
- toast(`Card added to ${deck ? deck.name : deckId} ✅`);
- gainXP(10);
+function saveCardForm(){
+  const deckId = document.getElementById('newDeck').value;
+  const q = document.getElementById('newQ').value.trim();
+  const a = document.getElementById('newA').value.trim();
+  if(!q){ toast('Please enter a question.'); return; }
+  if(!a){ toast('Please enter an answer.'); return; }
+  const deck = DECKS.find(d => d.id === deckId);
+  const tag  = deck ? deck.name : deckId;
+  if(!extraCards[deckId]) extraCards[deckId] = [];
+
+  if(_editingCardIndex !== null){
+    // Edit existing
+    extraCards[deckId][_editingCardIndex] = {q, a, t: tag};
+    toast('Question updated ✅');
+  } else {
+    // Add new
+    extraCards[deckId].push({q, a, t: tag});
+    toast(`Question added to ${tag} ✅`);
+  }
+
+  if(deckStacks[deckId]) deckStacks[deckId] = [];
+  document.getElementById('newQ').value = '';
+  document.getElementById('newA').value = '';
+  closeForm('card');
+  renderDecks();
+
+  // Refresh manage panel if open
+  const panel = document.getElementById('manageCardsPanel');
+  if(panel && panel.style.display !== 'none'){
+    const titleEl = document.getElementById('manageCardsTitle');
+    if(titleEl && titleEl.dataset.deckid === deckId) renderManageCards(deckId);
+  }
 }
 
-function addNewSubject(){
- const name = document.getElementById('newSubjName').value.trim();
- const icon = document.getElementById('newSubjIcon').value.trim() || '📖';
- const color = selectedSwatchColor;
- if(!name){ toast(' Enter a subject name.'); return; }
+// Alias for old addCard calls
+function addCard(){ saveCardForm(); }
 
- const id = name.toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,8) + Date.now().toString().slice(-4);
- if(DECKS.find(d => d.name.toLowerCase() === name.toLowerCase())){
- toast(' A subject with that name already exists.'); return;
- }
+function openManageCards(deckId){
+  closeForm('card');
+  closeForm('subject');
+  _editingCardDeckId = deckId;
+  const panel = document.getElementById('manageCardsPanel');
+  const titleEl = document.getElementById('manageCardsTitle');
+  const deck = DECKS.find(d => d.id === deckId);
+  if(titleEl){ titleEl.textContent = (deck ? deck.name : deckId) + ' — Questions'; titleEl.dataset.deckid = deckId; }
+  panel.style.display = 'block';
+  renderManageCards(deckId);
+  panel.scrollIntoView({behavior:'smooth',block:'start'});
+}
 
- // Add to DECKS
- DECKS.push({id, name, icon, color, mastery:0, due:0});
- extraCards[id] = [];
- BASE_CARDS[id] = [];
- deckStacks[id] = [];
- deckStats[id] = {seen:0, correct:0, quizCorrect:0, quizTotal:0, fcSets:0, quizSets:0};
- DCOLORS[id] = color;
- DHEX[id] = color;
+function closeManageCards(){
+  document.getElementById('manageCardsPanel').style.display = 'none';
+  _editingCardDeckId = null;
+}
 
- // Clear form
- document.getElementById('newSubjName').value = '';
- document.getElementById('newSubjIcon').value = '';
- closeForm('subject');
- renderDecks();
- renderDashboard();
- toast(`Subject "${name}" created! ✅`);
+// Pagination state per deck
+const _managePages = {}; // { deckId: { customPage, basePage } }
+const MANAGE_PAGE_SIZE = 10;
+
+function renderManageCards(deckId, customPage, basePage){
+  const list = document.getElementById('manageCardsList');
+  if(!list) return;
+
+  // Init page state
+  if(!_managePages[deckId]) _managePages[deckId] = {customPage:0, basePage:0};
+  if(customPage !== undefined) _managePages[deckId].customPage = customPage;
+  if(basePage   !== undefined) _managePages[deckId].basePage   = basePage;
+  const cPage = _managePages[deckId].customPage;
+  const bPage = _managePages[deckId].basePage;
+
+  const custom = extraCards[deckId] || [];
+  const base   = BASE_CARDS[deckId] || [];
+
+  // Apply search filter if active
+  const q = (_manageSearchQuery||'').toLowerCase();
+  const filterFn = c => !q || c.q.toLowerCase().includes(q) || c.a.toLowerCase().includes(q);
+  const filteredCustom = custom.filter(filterFn);
+  const filteredBase   = base.filter(filterFn);
+  const total = filteredCustom.length + filteredBase.length;
+
+  if(total === 0){
+    const emptyMsg = q
+      ? `<div class="search-no-results">No questions match "<strong>${_manageSearchQuery}</strong>"</div>`
+      : '<div class="empty-state"><div class="empty-icon">❓</div>No questions yet.<br>Click <strong>+ Add Question</strong> to create your first one.</div>';
+    list.innerHTML = emptyMsg;
+    return;
+  }
+
+  let html = '';
+
+  // ── YOUR QUESTIONS (paginated) ──
+  if(filteredCustom.length > 0){
+    const cTotalPages = Math.ceil(filteredCustom.length / MANAGE_PAGE_SIZE);
+    const cStart      = cPage * MANAGE_PAGE_SIZE;
+    const cEnd        = Math.min(cStart + MANAGE_PAGE_SIZE, filteredCustom.length);
+    const cSlice      = filteredCustom.slice(cStart, cEnd);
+
+    html += `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.65rem;flex-wrap:wrap;gap:6px">
+        <div style="font-size:0.72rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--accent)">
+          Your Questions (${filteredCustom.length}${q?' matching':''})
+        </div>
+        ${cTotalPages > 1 ? `<div style="font-size:0.72rem;color:var(--muted)">Page ${cPage+1} of ${cTotalPages}</div>` : ''}
+      </div>`;
+
+    html += cSlice.map((c, i) => {
+      const realIdx = cStart + i;
+      return `<div class="q-item">
+        <div class="q-item-q">${realIdx+1}. ${highlightText(c.q, _manageSearchQuery)}</div>
+        <div class="q-item-a">${highlightText(c.a, _manageSearchQuery)}</div>
+        <div class="q-item-actions">
+          <button class="btn btn-sm" style="background:rgba(var(--accentRGB),0.1);color:var(--accent);border:1px solid rgba(var(--accentRGB),0.25)" onclick="editCard('${deckId}',${realIdx})">Edit</button>
+          <button class="btn btn-sm" style="background:rgba(239,68,68,0.1);color:#ef4444;border:1px solid rgba(239,68,68,0.25)" onclick="deleteCard('${deckId}',${realIdx})">Delete</button>
+        </div>
+      </div>`;
+    }).join('');
+
+    // Custom pagination controls
+    if(cTotalPages > 1){
+      html += `<div class="pagination">`;
+      // Prev
+      html += `<button class="page-btn${cPage===0?' disabled':''}" onclick="${cPage>0?`renderManageCards('${deckId}',${cPage-1},undefined)`:'void(0)'}" ${cPage===0?'disabled':''}>← Prev</button>`;
+      // Page numbers
+      for(let p = 0; p < cTotalPages; p++){
+        if(cTotalPages <= 7 || p===0 || p===cTotalPages-1 || Math.abs(p-cPage)<=1){
+          html += `<button class="page-btn${p===cPage?' active':''}" onclick="renderManageCards('${deckId}',${p},undefined)">${p+1}</button>`;
+        } else if(Math.abs(p-cPage)===2){
+          html += `<span class="page-ellipsis">…</span>`;
+        }
+      }
+      // Next
+      html += `<button class="page-btn${cPage===cTotalPages-1?' disabled':''}" onclick="${cPage<cTotalPages-1?`renderManageCards('${deckId}',${cPage+1},undefined)`:'void(0)'}" ${cPage===cTotalPages-1?'disabled':''}>Next →</button>`;
+      html += `</div>`;
+      // Showing info
+      html += `<div style="font-size:0.72rem;color:var(--muted);text-align:center;margin-bottom:1rem">Showing ${cStart+1}–${cEnd} of ${filteredCustom.length} questions</div>`;
+    }
+  }
+
+  // ── BUILT-IN CARDS (paginated) ──
+  if(filteredBase.length > 0){
+    const bTotalPages = Math.ceil(filteredBase.length / MANAGE_PAGE_SIZE);
+    const bStart      = bPage * MANAGE_PAGE_SIZE;
+    const bEnd        = Math.min(bStart + MANAGE_PAGE_SIZE, filteredBase.length);
+    const bSlice      = filteredBase.slice(bStart, bEnd);
+
+    html += `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin:1.25rem 0 0.65rem;flex-wrap:wrap;gap:6px">
+        <div style="font-size:0.72rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted)">
+          Built-in Cards (${filteredBase.length}${q?' matching':''}) — read only
+        </div>
+        ${bTotalPages > 1 ? `<div style="font-size:0.72rem;color:var(--muted)">Page ${bPage+1} of ${bTotalPages}</div>` : ''}
+      </div>`;
+
+    html += bSlice.map((c, i) => `
+      <div class="q-item" style="opacity:0.65">
+        <div class="q-item-q">${bStart+i+1}. ${highlightText(c.q, _manageSearchQuery)}</div>
+        <div class="q-item-a">${highlightText(c.a, _manageSearchQuery)}</div>
+      </div>`).join('');
+
+    // Built-in pagination controls
+    if(bTotalPages > 1){
+      html += `<div class="pagination">`;
+      html += `<button class="page-btn${bPage===0?' disabled':''}" onclick="${bPage>0?`renderManageCards('${deckId}',undefined,${bPage-1})`:'void(0)'}" ${bPage===0?'disabled':''}>← Prev</button>`;
+      for(let p = 0; p < bTotalPages; p++){
+        if(bTotalPages <= 7 || p===0 || p===bTotalPages-1 || Math.abs(p-bPage)<=1){
+          html += `<button class="page-btn${p===bPage?' active':''}" onclick="renderManageCards('${deckId}',undefined,${p})">${p+1}</button>`;
+        } else if(Math.abs(p-bPage)===2){
+          html += `<span class="page-ellipsis">…</span>`;
+        }
+      }
+      html += `<button class="page-btn${bPage===bTotalPages-1?' disabled':''}" onclick="${bPage<bTotalPages-1?`renderManageCards('${deckId}',undefined,${bPage+1})`:'void(0)'}" ${bPage===bTotalPages-1?'disabled':''}>Next →</button>`;
+      html += `</div>`;
+      html += `<div style="font-size:0.72rem;color:var(--muted);text-align:center;margin-bottom:1rem">Showing ${bStart+1}–${bEnd} of ${filteredBase.length} built-in cards</div>`;
+    }
+  }
+
+  list.innerHTML = html;
+}
+
+function editCard(deckId, idx){
+  const card = extraCards[deckId]?.[idx];
+  if(!card) return;
+  _editingCardIndex  = idx;
+  _editingCardDeckId = deckId;
+  populateNewDeckSelect(deckId);
+  document.getElementById('newQ').value = card.q;
+  document.getElementById('newA').value = card.a;
+  document.getElementById('cardFormTitle').textContent = 'Edit Question';
+  document.getElementById('addCardForm').classList.add('open');
+  document.getElementById('addCardForm').scrollIntoView({behavior:'smooth',block:'start'});
+  setTimeout(()=>document.getElementById('newQ').focus(),100);
+}
+
+function deleteCard(deckId, idx){
+  if(!confirm('Delete this question?')) return;
+  extraCards[deckId].splice(idx, 1);
+  if(deckStacks[deckId]) deckStacks[deckId] = [];
+  // Reset to page 0 to avoid landing on empty page
+  if(_managePages[deckId]) _managePages[deckId].customPage = 0;
+  renderManageCards(deckId);
+  renderDecks();
+  toast('Question deleted');
+}
+
+function saveSubjectForm(){
+  const name  = document.getElementById('newSubjName').value.trim();
+  const icon  = '📖'; // icon removed — color only
+  const color = selectedSwatchColor || '#0eb8d8';
+  if(!name){ toast('Please enter a subject name.'); return; }
+
+  if(_editingSubjectId){
+    // Edit existing custom subject
+    const d = DECKS.find(x => x.id === _editingSubjectId);
+    if(d){ d.name = name; d.icon = icon; d.color = color; DHEX[_editingSubjectId] = color; DCOLORS[_editingSubjectId] = color; }
+    closeForm('subject');
+    renderDecks();
+    toast(`Subject updated ✅`);
+    return;
+  }
+
+  if(DECKS.find(d => d.name.toLowerCase() === name.toLowerCase())){
+    toast('A subject with that name already exists.'); return;
+  }
+
+  const id = 'c_' + name.toLowerCase().replace(/[^a-z0-9]/g,'_').slice(0,12) + '_' + Date.now().toString().slice(-4);
+  DECKS.push({id, name, icon, color, mastery:0, due:0});
+  extraCards[id]  = [];
+  BASE_CARDS[id]  = [];
+  deckStacks[id]  = [];
+  deckStats[id]   = {seen:0,correct:0,quizCorrect:0,quizTotal:0,fcSets:0,quizSets:0};
+  DCOLORS[id]     = color;
+  DHEX[id]        = color;
+
+  document.getElementById('newSubjName').value = '';
+
+  closeForm('subject');
+  renderDecks();
+  renderDashboard();
+  toast(`Subject "${name}" created! Now add some questions.`);
+
+  // Auto-open manage panel for the new subject
+  setTimeout(()=>openManageCards(id), 300);
+}
+
+// Alias
+function addNewSubject(){ saveSubjectForm(); }
+
+function deleteSubject(deckId){
+  const deck = DECKS.find(d => d.id === deckId);
+  if(!deck) return;
+  const cardCount = (extraCards[deckId]||[]).length;
+  const msg = cardCount > 0
+    ? `Delete subject "${deck.name}" and all ${cardCount} custom question${cardCount!==1?'s':''}? This cannot be undone.`
+    : `Delete subject "${deck.name}"?`;
+  if(!confirm(msg)) return;
+  const idx = DECKS.findIndex(d => d.id === deckId);
+  if(idx > -1) DECKS.splice(idx, 1);
+  delete extraCards[deckId];
+  delete BASE_CARDS[deckId];
+  delete deckStacks[deckId];
+  delete deckStats[deckId];
+  delete DCOLORS[deckId];
+  delete DHEX[deckId];
+  renderDecks();
+  renderDashboard();
+  toast(`Subject deleted`);
 }
 
 // ════════════════════════════════════════════
@@ -456,8 +800,9 @@ function showQuizQ(){
  const c=quizData[quizIdx];
  const deck=DECKS.find(d=>d.id===quizDeckId);
  document.getElementById('quizDeckLbl').textContent=deck.name;
- document.getElementById('quizCounterLbl').textContent=`Q ${quizIdx+1}/${quizData.length}`;
- document.getElementById('quizBar').style.width=(quizIdx/quizData.length*100)+'%';
+ const _qPct = Math.round((quizIdx / quizData.length) * 100);
+ document.getElementById('quizCounterLbl').textContent=`Q ${quizIdx+1}/${quizData.length} · ${_qPct}% done`;
+ document.getElementById('quizBar').style.width=_qPct+'%';
  document.getElementById('quizQ').textContent=c.q;
  document.getElementById('quizExp').style.display='none';
  document.getElementById('quizNextBtn').style.display='none';
@@ -482,6 +827,10 @@ function answerQ(btn,chosen,correct){
  if(quizAnswered)return;
  quizAnswered=true;
  const ok=chosen.trim()===correct.trim();
+ // Update progress bar to reflect this answered question
+ const _answeredPct = Math.round(((quizIdx + 1) / quizData.length) * 100);
+ document.getElementById('quizBar').style.width=_answeredPct+'%';
+ document.getElementById('quizCounterLbl').textContent=`Q ${quizIdx+1}/${quizData.length} · ${_answeredPct}% done`;
  btn.classList.add(ok?'correct':'wrong');
  document.querySelectorAll('.qchoice').forEach(b=>{
  b.disabled=true;
@@ -685,14 +1034,14 @@ function renderProgress(){
 
  // Milestones
  const milestoneList = [
- {icon:'', title:'First Quiz', desc:'Complete your first quiz set', done: quizSetsCompleted >= 1},
- {icon:'', title:'Card Flipper', desc:'Review your first flashcard set', done: fcSetsCompleted >= 1},
+ {icon:'★', title:'First Quiz', desc:'Complete your first quiz set', done: quizSetsCompleted >= 1},
+ {icon:'◈', title:'Card Flipper', desc:'Review your first flashcard set', done: fcSetsCompleted >= 1},
  {icon:'🔥', title:'On Fire', desc:'Get a 5-answer streak', done: bestStreak >= 5},
- {icon:'', title:'Speed Learner', desc:'Answer 50 questions correctly', done: totalCorrect >= 50},
+ {icon:'▲', title:'Speed Learner', desc:'Answer 50 questions correctly', done: totalCorrect >= 50},
  {icon:'💯', title:'Perfect Set', desc:'Score 100% on a quiz', done: DECKS.some(d => deckStats[d.id]?.quizTotal > 0 && deckStats[d.id]?.quizCorrect === deckStats[d.id]?.quizTotal && deckStats[d.id]?.quizTotal >= 10)},
  {icon:'📚', title:'Scholar', desc:'Answer 100 questions correctly', done: totalCorrect >= 100},
  {icon:'🏆', title:'Champion', desc:'Answer 200 questions correctly', done: totalCorrect >= 200},
- {icon:'', title:'Focused', desc:'Complete a focus timer session', done: studyMins > 0},
+ {icon:'◎', title:'Focused', desc:'Complete a focus timer session', done: studyMins > 0},
  {icon:'🧠', title:'All Subjects', desc:'Study at least one set in every subject',done: DECKS.every(d => (deckStats[d.id]?.seen||0)+(deckStats[d.id]?.quizTotal||0) > 0)},
  {icon:'🌟', title:'Consistent', desc:'Reach a 10-question streak', done: bestStreak >= 10},
  ];
@@ -971,48 +1320,107 @@ function setMode_(mode, btn){
  toast(labels[mode] || `🎨 ${mode} theme`);
 }
 const _origShowPage = typeof showPage === 'function' ? showPage : null;
-function showPage(id, el){
- const hero = document.getElementById('heroSection');
- const featureBand = document.querySelector('.feature-band');
- const ctaBand = document.querySelector('.cta-band');
- const iconGrid = document.querySelector('.icon-grid-section');
- const appContent = document.querySelector('.app-content');
- const isHome = id === 'dashboard';
+function showPage(id, el, pushHistory){
+  const hero        = document.getElementById('heroSection');
+  const featureBand = document.querySelector('.feature-band');
+  const ctaBand     = document.querySelector('.cta-band');
+  const iconGrid    = document.querySelector('.icon-grid-section');
+  const appContent  = document.querySelector('.app-content');
+  const isHome      = id === 'dashboard';
 
- // Landing sections only visible on Home
- [hero, featureBand, ctaBand, iconGrid].forEach(s => {
- if(s) s.style.display = isHome ? '' : 'none';
- });
+  // Track history for back button
+  if(pushHistory !== false && id !== _currentPage){
+    _pageHistory.push(_currentPage);
+  }
+  _currentPage = id;
 
- // App content area: hide on home, show on all other pages
- if(appContent) appContent.style.display = isHome ? 'none' : 'block';
+  // Show/hide back button
+  const backBtn = document.getElementById('backBtn');
+  if(backBtn) backBtn.classList.toggle('visible', _pageHistory.length > 0 && !isHome);
 
- // Nav active state
- document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
- if(el && el.classList) el.classList.add('active');
+  // Landing sections only on Home
+  [hero, featureBand, ctaBand, iconGrid].forEach(s => {
+    if(s) s.style.display = isHome ? '' : 'none';
+  });
 
- // Only switch pages when NOT home
- if(!isHome){
- document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
- const pg = document.getElementById('page-' + id);
- if(pg) pg.classList.add('active');
- }
+  // App content: hide on home
+  if(appContent) appContent.style.display = isHome ? 'none' : 'block';
 
- const tt = document.getElementById('topbarTitle');
- if(tt){ const T={dashboard:'Home',flashcards:'Flashcards',decks:'My Decks',quiz:'Quiz Mode',timer:'Focus Timer',progress:'Progress',notes:'Quick Notes',settings:'Settings'}; tt.textContent=T[id]||id; }
+  // Nav active state
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  if(el && el.classList) el.classList.add('active');
+  // Also highlight matching nav item by id
+  document.querySelectorAll('.nav-item').forEach(n => {
+    const oc = n.getAttribute('onclick') || '';
+    if(oc.includes("'"+id+"'")) n.classList.add('active');
+  });
 
- // Page-specific renderers
- if(id==='flashcards') initFC();
- if(id==='decks') renderDecks();
- if(id==='quiz') renderQuizSetup();
- if(id==='progress') renderProgress();
- if(id==='notes') renderNotes();
- if(id==='settings') renderSettings();
+  // Switch page content
+  if(!isHome){
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    const pg = document.getElementById('page-' + id);
+    if(pg) pg.classList.add('active');
+  }
 
- // Always scroll to top so page headers and buttons are fully visible
- window.scrollTo({top:0, behavior:'smooth'});
+  // Push browser history state
+  if(pushHistory !== false){
+    history.pushState({page: id}, '', '#' + id);
+  }
+
+  const tt = document.getElementById('topbarTitle');
+  if(tt){
+    const T={dashboard:'Home',flashcards:'Flashcards',decks:'My Decks',quiz:'Quiz Mode',
+             timer:'Focus Timer',progress:'Progress',notes:'Quick Notes',settings:'Settings'};
+    tt.textContent = T[id] || id;
+  }
+
+  if(id==='flashcards') initFC();
+  if(id==='decks')      renderDecks();
+  if(id==='quiz')       renderQuizSetup();
+  if(id==='progress')   renderProgress();
+  if(id==='notes')      renderNotes();
+  if(id==='settings')   renderSettings();
+
+  window.scrollTo({top:0, behavior:'smooth'});
 }
 
+function goBack(){
+  if(_pageHistory.length === 0){ navTo('dashboard'); return; }
+  const prev = _pageHistory.pop();
+  showPage(prev, null, false);
+}
+
+// Handle browser back/forward buttons
+window.addEventListener('popstate', function(e){
+  // If auth screen is visible, push a new state to prevent going back behind it
+  const authScreen = document.getElementById('authScreen');
+  if(authScreen && !authScreen.classList.contains('hidden')){
+    history.pushState({page:'auth'}, '', '#login');
+    return;
+  }
+  // If no active session, force back to login
+  if(!getSession()){
+    history.pushState({page:'auth'}, '', '#login');
+    authScreen.classList.remove('hidden');
+    return;
+  }
+  const page = (e.state && e.state.page && e.state.page !== 'auth') ? e.state.page : 'dashboard';
+  _pageHistory.pop();
+  showPage(page, null, false);
+});
+
+function toggleMobileNav(){
+  const nav = document.getElementById('navLinks');
+  const overlay = document.getElementById('navOverlay');
+  if(nav) nav.classList.toggle('open');
+  if(overlay) overlay.classList.toggle('show');
+}
+function closeMobileNav(){
+  const nav = document.getElementById('navLinks');
+  const overlay = document.getElementById('navOverlay');
+  if(nav) nav.classList.remove('open');
+  if(overlay) overlay.classList.remove('show');
+}
 function navTo(id){
  const items = document.querySelectorAll('.nav-item');
  let target = null;
@@ -1027,3 +1435,239 @@ function navTo(id){
 renderDashboard();
 updateTimer();
 initDeckStats();
+
+// ══════════════════════════════════════════════
+// SEARCH FUNCTIONALITY
+// ══════════════════════════════════════════════
+
+function highlightText(text, query){
+  if(!query) return text;
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return text.replace(new RegExp('('+escaped+')', 'gi'), '<mark class="search-highlight">$1</mark>');
+}
+
+// ── FLASHCARD SEARCH ──
+function searchFlashcards(query){
+  const results = document.getElementById('fcSearchResults');
+  const clearBtn = document.getElementById('fcSearchClear');
+  const arena    = document.querySelector('.fc-arena');
+  const rating   = document.getElementById('fcRating');
+  const addForm  = document.getElementById('fcAddForm');
+  query = query.trim();
+
+  if(clearBtn) clearBtn.style.display = query ? 'flex' : 'none';
+
+  if(!query){
+    results.style.display = 'none';
+    if(arena) arena.style.display = '';
+    return;
+  }
+
+  // Hide flashcard arena while searching
+  if(arena) arena.style.display = 'none';
+  if(rating) rating.style.display = 'none';
+  if(addForm) addForm.style.display = 'none';
+  results.style.display = 'block';
+
+  // Search across ALL decks
+  const lower = query.toLowerCase();
+  let matches = [];
+  DECKS.forEach(d => {
+    const cards = [...(BASE_CARDS[d.id]||[]), ...(extraCards[d.id]||[])];
+    cards.forEach(c => {
+      if(c.q.toLowerCase().includes(lower) || c.a.toLowerCase().includes(lower)){
+        matches.push({...c, deckName: d.name});
+      }
+    });
+  });
+
+  if(matches.length === 0){
+    results.innerHTML = `<div class="search-no-results">No questions found for "<strong>${query}</strong>"</div>`;
+    return;
+  }
+
+  results.innerHTML = `
+    <div style="font-size:0.75rem;color:var(--muted);margin-bottom:0.65rem;font-weight:600">
+      ${matches.length} result${matches.length!==1?'s':''} for "${query}"
+    </div>` +
+    matches.slice(0,50).map(c => `
+      <div class="search-result-item" onclick="showSearchCardDetail('${encodeURIComponent(JSON.stringify({q:c.q,a:c.a,t:c.t||'',deckName:c.deckName}))}')">
+        <div class="search-result-tag">${c.deckName || c.t || ''}</div>
+        <div class="search-result-q">${highlightText(c.q, query)}</div>
+        <div class="search-result-a">${highlightText(c.a, query)}</div>
+      </div>`).join('') +
+    (matches.length > 50 ? `<div class="search-no-results">Showing 50 of ${matches.length} results. Refine your search for more specific results.</div>` : '');
+}
+
+function showSearchCardDetail(encoded){
+  try{
+    const c = JSON.parse(decodeURIComponent(encoded));
+    const popup = document.createElement('div');
+    popup.style.cssText = `position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:500;display:flex;align-items:center;justify-content:center;padding:1rem`;
+    popup.innerHTML = `
+      <div style="background:var(--card);border-radius:18px;padding:1.5rem;max-width:480px;width:100%;box-shadow:0 8px 40px rgba(0,0,0,0.25);border:1px solid var(--border2)">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1rem">
+          <span class="search-result-tag">${c.deckName||c.t||''}</span>
+          <button onclick="this.closest('[style*=fixed]').remove()" style="background:var(--card2);border:none;cursor:pointer;color:var(--muted);border-radius:8px;padding:4px 10px;font-size:0.8rem;font-weight:600">✕ Close</button>
+        </div>
+        <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:var(--accent);margin-bottom:0.4rem">Question</div>
+        <div style="font-size:1rem;font-weight:600;color:var(--text);line-height:1.5;margin-bottom:1.1rem">${c.q}</div>
+        <div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:var(--teal);margin-bottom:0.4rem">Answer</div>
+        <div style="font-size:0.9rem;color:var(--text);line-height:1.55;">${c.a}</div>
+      </div>`;
+    popup.addEventListener('click', e => { if(e.target===popup) popup.remove(); });
+    document.body.appendChild(popup);
+  } catch(e){ console.error(e); }
+}
+
+function clearFCSearch(){
+  const inp = document.getElementById('fcSearchInput');
+  if(inp) inp.value = '';
+  searchFlashcards('');
+  const arena = document.querySelector('.fc-arena');
+  if(arena) arena.style.display = '';
+  const addForm = document.getElementById('fcAddForm');
+  if(addForm) addForm.style.display = '';
+}
+
+// ── MANAGE CARDS SEARCH ──
+let _manageSearchQuery = '';
+
+function searchManageCards(query){
+  const clearBtn = document.getElementById('manageSearchClear');
+  _manageSearchQuery = query.trim();
+  if(clearBtn) clearBtn.style.display = _manageSearchQuery ? 'flex' : 'none';
+  const deckId = document.getElementById('manageCardsTitle')?.dataset.deckid;
+  if(deckId) renderManageCards(deckId, 0, 0);
+}
+
+function clearManageSearch(){
+  const inp = document.getElementById('manageSearchInput');
+  if(inp) inp.value = '';
+  _manageSearchQuery = '';
+  const clearBtn = document.getElementById('manageSearchClear');
+  if(clearBtn) clearBtn.style.display = 'none';
+  const deckId = document.getElementById('manageCardsTitle')?.dataset.deckid;
+  if(deckId) renderManageCards(deckId, 0, 0);
+}
+
+
+// ══════════════════════════════════════════════
+// FLASHCARD INTERACTIVE TYPE MODE
+// ══════════════════════════════════════════════
+let _fcMode = 'flip'; // 'flip' or 'type'
+let _typeStats = {correct:0, partial:0, wrong:0, skipped:0};
+
+function setFCMode(mode){
+  _fcMode = mode;
+  document.getElementById('modeBtnFlip').classList.toggle('active', mode==='flip');
+  document.getElementById('modeBtnType').classList.toggle('active', mode==='type');
+  document.getElementById('fcFlipMode').style.display = mode==='flip' ? '' : 'none';
+  document.getElementById('fcTypeMode').style.display = mode==='type' ? '' : 'none';
+  // Sync current card to type mode
+  if(mode==='type') syncTypeCard();
+}
+
+function syncTypeCard(){
+  const q = document.getElementById('fcQ').textContent;
+  const tag = document.getElementById('fcTag').textContent;
+  const tq = document.getElementById('fcTypeQ');
+  const tt = document.getElementById('fcTypeTag');
+  if(tq) tq.textContent = q;
+  if(tt) tt.textContent = tag;
+  // Reset input area
+  const inp = document.getElementById('fcTypeInput');
+  if(inp){ inp.value=''; inp.style.borderColor='var(--border2)'; }
+  document.getElementById('fcTypeInputArea').style.display = 'block';
+  document.getElementById('fcTypeReveal').style.display = 'none';
+  const rc = document.getElementById('fcTypeResultCard');
+  if(rc) rc.className = 'fc-type-result-card';
+  // Update stats display
+  updateTypeStats();
+}
+
+function updateTypeStats(){
+  const s = _typeStats;
+  const total = s.correct+s.partial+s.wrong+s.skipped;
+  if(total===0) return;
+  let bar = document.getElementById('fcTypeStatsBar');
+  if(!bar){
+    const area = document.getElementById('fcTypeInputArea');
+    if(area){
+      bar = document.createElement('div');
+      bar.id='fcTypeStatsBar';
+      bar.className='fc-type-stats';
+      area.insertBefore(bar, area.firstChild);
+    }
+  }
+  if(bar) bar.innerHTML = `
+    <div class="fc-type-stat" style="color:var(--green)">Correct <span>${s.correct}</span></div>
+    <div class="fc-type-stat" style="color:var(--amber)">Partial <span>${s.partial}</span></div>
+    <div class="fc-type-stat" style="color:#ef4444">Wrong <span>${s.wrong}</span></div>
+    <div class="fc-type-stat">Skipped <span>${s.skipped}</span></div>`;
+}
+
+function submitTypeAnswer(){
+  const inp = document.getElementById('fcTypeInput');
+  const userAnswer = (inp?.value||'').trim();
+  if(!userAnswer){ toast('Please type your answer first.'); return; }
+
+  const correctAnswer = document.getElementById('fcA').textContent;
+  const ya = document.getElementById('fcYourAnswer');
+  const ca = document.getElementById('fcCorrectAnswer');
+  if(ya) ya.textContent = userAnswer;
+  if(ca) ca.textContent = correctAnswer;
+
+  // Auto-check similarity
+  const similarity = checkSimilarity(userAnswer, correctAnswer);
+  const rc = document.getElementById('fcTypeResultCard');
+  const ri = document.getElementById('fcResultIcon');
+  const rl = document.getElementById('fcResultLabel');
+
+  if(similarity >= 0.85){
+    if(rc) rc.className = 'fc-type-result-card result-correct';
+    if(ri) ri.textContent = '✓';
+    if(rl) rl.textContent = 'Looks Correct!';
+  } else if(similarity >= 0.4){
+    if(rc) rc.className = 'fc-type-result-card result-partial';
+    if(ri) ri.textContent = '~';
+    if(rl) rl.textContent = 'Partially Correct';
+  } else {
+    if(rc) rc.className = 'fc-type-result-card result-wrong';
+    if(ri) ri.textContent = '✗';
+    if(rl) rl.textContent = 'Incorrect';
+  }
+
+  document.getElementById('fcTypeInputArea').style.display = 'none';
+  document.getElementById('fcTypeReveal').style.display = 'block';
+}
+
+function checkSimilarity(a, b){
+  a = a.toLowerCase().replace(/[^a-z0-9\s]/g,'').trim();
+  b = b.toLowerCase().replace(/[^a-z0-9\s]/g,'').trim();
+  if(a===b) return 1;
+  // Check if user answer is contained in correct (partial credit)
+  if(b.includes(a) && a.length > 3) return 0.75;
+  // Word overlap
+  const wa = new Set(a.split(/\s+/));
+  const wb = new Set(b.split(/\s+/));
+  const intersection = [...wa].filter(w=>wb.has(w)&&w.length>2).length;
+  const union = new Set([...wa,...wb]).size;
+  return union > 0 ? intersection/union : 0;
+}
+
+function rateTypeCard(result){
+  _typeStats[result==='correct'?'correct':result==='partial'?'partial':'wrong']++;
+  // Map to flip mode rating for stats
+  const rateMap = {correct:'good', partial:'hard', wrong:'again'};
+  rateCard(rateMap[result]||'again');
+  // After advancing, sync the new card
+  setTimeout(()=>{ if(_fcMode==='type') syncTypeCard(); }, 220);
+}
+
+function skipTypeAnswer(){
+  _typeStats.skipped++;
+  rateCard('again');
+  setTimeout(()=>{ if(_fcMode==='type') syncTypeCard(); }, 220);
+}
+
